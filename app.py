@@ -328,6 +328,65 @@ def load_ga4(start: date, end: date) -> tuple[dict[str, str], pd.DataFrame, pd.D
     return prop, page_df, trend_df
 
 
+def zeiss_destination(link_url: str) -> str:
+    url = link_url.lower()
+    if "/metrology/us/home.html" in url:
+        return "Industrial Quality Solutions"
+    if "100-years-zeiss-usa" in url and "utm_campaign=logo" in url:
+        return "100 Years ZEISS USA · sponsor logo"
+    if "100-years-zeiss-usa" in url:
+        return "100 Years ZEISS USA"
+    if "/corporate/" in url:
+        return "ZEISS corporate website"
+    return "ZEISS website"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_zeiss_outbound_clicks(start: date, end: date) -> tuple[dict[str, int], pd.DataFrame]:
+    prop = discover_property()
+    session = credentials_session()
+    filters = {
+        "andGroup": {
+            "expressions": [
+                {"filter": {"fieldName": "eventName", "stringFilter": {"matchType": "EXACT", "value": "click"}}},
+                {"filter": {"fieldName": "pagePath", "stringFilter": {"matchType": "BEGINS_WITH", "value": PAGE_PREFIX}}},
+                {"filter": {"fieldName": "linkUrl", "stringFilter": {"matchType": "CONTAINS", "value": "zeiss.com", "caseSensitive": False}}},
+            ]
+        }
+    }
+
+    def query(dimensions: list[str]) -> dict[str, Any]:
+        payload = {
+            "dateRanges": [{"startDate": start.isoformat(), "endDate": end.isoformat()}],
+            "dimensions": [{"name": name} for name in dimensions],
+            "metrics": [{"name": "eventCount"}, {"name": "activeUsers"}],
+            "dimensionFilter": filters,
+            "limit": "10000",
+        }
+        response = session.post(
+            f"https://analyticsdata.googleapis.com/v1beta/properties/{prop['id']}:runReport",
+            json=payload,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    totals_report = query([])
+    detail_report = query(["linkUrl", "pagePath", "pageTitle"])
+    totals_frame = report_frame(totals_report)
+    detail = report_frame(detail_report)
+    summary = {
+        "Clicks": int(totals_frame["eventCount"].iloc[0]) if not totals_frame.empty else 0,
+        "Users": int(totals_frame["activeUsers"].iloc[0]) if not totals_frame.empty else 0,
+    }
+    if not detail.empty:
+        detail["Destination"] = detail["linkUrl"].map(zeiss_destination)
+        detail["State"] = detail["pagePath"].map(state_from_path)
+        detail = detail.rename(
+            columns={"pageTitle": "Source page", "pagePath": "Source path", "eventCount": "Clicks", "activeUsers": "Users"}
+        )
+    return summary, detail
+
+
 def meta_get(url: str, token: str) -> dict[str, Any]:
     response = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
     response.raise_for_status()
@@ -812,6 +871,85 @@ with zeiss_tab:
             )
     except Exception as exc:
         st.warning("Zeiss GAM reporting is temporarily unavailable.")
+        st.exception(exc)
+
+    st.markdown("### Clicks through to ZEISS")
+    st.markdown(
+        "<div class='section-note'>GA4 outbound click events from the State by State hub and state pages to destinations on zeiss.com.</div>",
+        unsafe_allow_html=True,
+    )
+    try:
+        with st.spinner("Loading ZEISS outbound clicks from GA4…"):
+            zeiss_click_summary, zeiss_click_detail = load_zeiss_outbound_clicks(start_date, end_date)
+        industrial_clicks = (
+            int(zeiss_click_detail.loc[zeiss_click_detail["Destination"] == "Industrial Quality Solutions", "Clicks"].sum())
+            if not zeiss_click_detail.empty else 0
+        )
+        source_pages = int(zeiss_click_detail["Source path"].nunique()) if not zeiss_click_detail.empty else 0
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("All ZEISS outbound clicks", fmt_int(zeiss_click_summary["Clicks"]))
+        c2.metric("Industrial Quality clicks", fmt_int(industrial_clicks))
+        c3.metric("Clicking users", fmt_int(zeiss_click_summary["Users"]))
+        c4.metric("Source pages", fmt_int(source_pages))
+
+        if zeiss_click_detail.empty:
+            st.info("No outbound clicks to ZEISS were recorded in the selected date range.")
+        else:
+            destination_summary = (
+                zeiss_click_detail.groupby("Destination", as_index=False)["Clicks"]
+                .sum()
+                .sort_values("Clicks", ascending=True)
+            )
+            click_fig = px.bar(
+                destination_summary,
+                x="Clicks",
+                y="Destination",
+                orientation="h",
+                text="Clicks",
+                color="Clicks",
+                color_continuous_scale=[[0, "#8ccfd2"], [1, "#0c6287"]],
+            )
+            click_fig.update_traces(
+                texttemplate="%{x:,.0f}",
+                textposition="inside",
+                hovertemplate="%{y}<br>Outbound clicks: %{x:,.0f}<extra></extra>",
+            )
+            click_fig.update_layout(
+                height=340,
+                margin=dict(l=10, r=20, t=45, b=20),
+                title=dict(text="Outbound clicks by ZEISS destination", font=dict(color="#073c5b", size=18)),
+                paper_bgcolor="white",
+                plot_bgcolor="white",
+                font=dict(color="#315568"),
+                coloraxis_showscale=False,
+                xaxis=dict(title="GA4 outbound clicks", gridcolor="#e1eeee", rangemode="tozero"),
+                yaxis=dict(title="", automargin=True),
+            )
+            st.plotly_chart(click_fig, width="stretch", config={"displayModeBar": False})
+
+            click_table = (
+                zeiss_click_detail.groupby(["Destination", "State", "Source page", "Source path"], as_index=False)
+                .agg({"Clicks": "sum", "Users": "sum"})
+                .sort_values("Clicks", ascending=False)
+            )
+            click_table["Source page"] = click_table["Source page"].replace("(not set)", "State by State page")
+            click_table["Page"] = "https://www.advancedmanufacturing.org" + click_table["Source path"]
+            st.markdown("#### Click-through detail")
+            st.dataframe(
+                click_table[["Destination", "State", "Source page", "Clicks", "Users", "Page"]],
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Clicks": st.column_config.NumberColumn(format="localized"),
+                    "Users": st.column_config.NumberColumn(format="localized"),
+                    "Page": st.column_config.LinkColumn(display_text="Open source page"),
+                },
+            )
+            st.caption(
+                "GA4 records the two Industrial Quality Solutions links as the same truncated link URL and does not capture link text, so map-sign and sponsored-logo clicks are combined. GAM ad clicks and GA4 outbound clicks measure different actions and should not be expected to match."
+            )
+    except Exception as exc:
+        st.warning("ZEISS outbound-click reporting is temporarily unavailable.")
         st.exception(exc)
 
 with sponsor_tab:
