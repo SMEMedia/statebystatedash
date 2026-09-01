@@ -11,9 +11,11 @@ __pycache__/
 *.py[cod]
 .venv/
 
-# Temporary data and tooling
+# Local editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Temporary working files
 work/
-node_modules/
-.wrangler/
-dist/
-.next/
